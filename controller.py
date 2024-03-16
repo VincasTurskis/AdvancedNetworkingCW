@@ -137,9 +137,73 @@ class Router(RyuApp):
         parser = datapath.ofproto_parser
         pkt = packet.Packet(ev.msg.data)
         in_port = ev.msg.match["in_port"]
-
+        # if pkt.get_protocol(ethernet).dst != self.interface_table.get_interface(dpid, in_port)["hw"]:
+            # self.logger.info("❗️\tpacket destination mac address did not match port address. Dropping packet")
+            # self.logger.info("❗️\tdestination MAC address: {}".format(pkt.get_protocol(ethernet).dst))
+            # self.logger.info("❗️\tMAC address of port: {}".format(self.interface_table.get_interface(dpid, in_port)["hw"]))
+        
         if self.__illegal_packet(pkt):
             return
+
+        eth_packet = pkt.get_protocol(ethernet)
+        network_packet = pkt.get_protocol(ipv4)
+        # ARP
+        if network_packet == None:
+            network_packet = pkt.get_protocol(arp)
+            route = self.routing_table.get_route(dpid, network_packet.dst_ip)
+            if route == None:
+                # send ICMP message
+                return
+            if route[0] == None:
+                actions = [
+                    # parser.OFPActionSetField(eth_src = eth_packet.dst),
+                    # parser.OFPActionSetField(eth_dst = route[2]),
+                    parser.OFPActionOutput(route[1])
+                ]
+                out = parser.OFPPacketOut(
+                    datapath=datapath, 
+                    buffer_id=ev.msg.buffer_id, 
+                    in_port=in_port, 
+                    actions=actions, 
+                    data=ev.msg.data
+                )
+                datapath.send_msg(out)
+        # IP
+        else:
+            if self.routing_table.get_route(dpid, network_packet.dst) == None:
+                # send ICMP message
+                return
+            route = self.routing_table.get_route(dpid, network_packet.dst)
+            # Means either IP not known or no next hop (direct connection)
+            if route[0] == None:
+                actions = [
+                    parser.OFPActionSetField(eth_src = eth_packet.dst),
+                    parser.OFPActionSetField(eth_dst = self.arp_table.get_hw(dpid, network_packet.dst)),
+                    parser.OFPActionOutput(route[1])
+                ]
+                out = parser.OFPPacketOut(
+                    datapath=datapath, 
+                    buffer_id=ev.msg.buffer_id, 
+                    in_port=in_port, 
+                    actions=actions, 
+                    data=ev.msg.data
+                )
+                datapath.send_msg(out)
+            else:
+                mac_of_next_hop = self.arp_table.get_hw(dpid, route[0])
+                actions = [
+                    parser.OFPActionSetField(eth_src = eth_packet.dst),
+                    parser.OFPActionSetField(eth_dst = mac_of_next_hop),
+                    parser.OFPActionOutput(route[1])
+                ]
+                out = parser.OFPPacketOut(
+                    datapath=datapath, 
+                    buffer_id=ev.msg.buffer_id, 
+                    in_port=in_port, 
+                    actions=actions, 
+                    data=ev.msg.data
+                )
+                datapath.send_msg(out)
 
         self.logger.info("❗️\tevent 'packet in' from datapath: {}".format(dpid_to_str(datapath.id)))
 
@@ -368,7 +432,7 @@ class StaticRoutingTable(Table):
         for x in self._table[dpid]:
             if any([x['destination'] == ip,
                     ipaddress.ip_address(ip) in ipaddress.ip_network(x['destination'])]):
-                return x['hop'], x['out_port'], x['nat']
+                return x['hop'], x['out_port'], x['destination']
         return None, None, None
 
 
