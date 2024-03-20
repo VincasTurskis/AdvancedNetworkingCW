@@ -32,6 +32,7 @@ from ryu.lib.packet.ipv4 import ipv4
 from ryu.lib.packet.ipv6 import ipv6
 from ryu.lib.packet.lldp import lldp
 from ryu.lib.packet.icmp import icmp
+from ryu.lib.packet.icmp import dest_unreach
 from ryu.lib.packet.tcp import tcp
 from ryu.lib.packet.udp import udp
 from ryu.lib.dpid import dpid_to_str
@@ -68,6 +69,7 @@ class Router(RyuApp):
         if not (self.arp_table.loaded() and self.routing_table.loaded() and self.interface_table.loaded() and self.firewall_rules.loaded()):
             self.logger.error("🆘\tjson table loading was not successful")
             sys.exit(1)
+        
 
     # EVENT HANDLER FUNCTIONS
     # -----------------------
@@ -109,7 +111,9 @@ class Router(RyuApp):
         self.__request_port_info(datapath)
         actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_CONTROLLER, datapath.ofproto.OFPCML_NO_BUFFER)]
         self.__add_flow(datapath, 0, match, actions)
+        # self.create_firewall(datapath, dpid, datapath.ofproto_parser, datapath.ofproto)
         self.logger.info("🤝\thandshake taken place with datapath: {}".format(dpid_to_str(datapath.id)))
+
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -117,8 +121,7 @@ class Router(RyuApp):
         Packet In Event Handler
 
         The bulk of your packet processing logic will reside in this function &
-        all functions called from this function. There is currently NO logic
-        here, so it wont do much until you edit it!
+        all functions called from this function.
 
         Event Documentation:
         https://ryu.readthedocs.io/en/latest/ofproto_v1_3_ref.html#ryu.ofproto.ofproto_v1_3_parser.OFPPacketIn
@@ -133,8 +136,8 @@ class Router(RyuApp):
         """
         datapath = ev.msg.datapath
         dpid = dpid_to_str(datapath.id)
-        ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
         pkt = packet.Packet(ev.msg.data)
         in_port = ev.msg.match["in_port"]
         # if pkt.get_protocol(ethernet).dst != self.interface_table.get_interface(dpid, in_port)["hw"]:
@@ -149,10 +152,11 @@ class Router(RyuApp):
         network_packet = pkt.get_protocol(ipv4)
         # ARP
         if network_packet == None:
+            self.logger.info("Got ARP packet")
             network_packet = pkt.get_protocol(arp)
             route = self.routing_table.get_route(dpid, network_packet.dst_ip)
-            if route == None:
-                # send ICMP message
+            if route == (None, None, None):
+                self.__send_icmp_packet(pkt, datapath, dpid, parser, ofproto, network_packet.src, 3, 6)
                 return
             if route[0] == None:
                 actions = [
@@ -170,8 +174,9 @@ class Router(RyuApp):
                 datapath.send_msg(out)
         # IP
         else:
-            if self.routing_table.get_route(dpid, network_packet.dst) == None:
-                # send ICMP message
+            self.logger.info("Got IP packet")
+            if self.routing_table.get_route(dpid, network_packet.dst) == (None, None, None):
+                self.__send_icmp_packet(pkt, datapath, dpid, parser, ofproto, network_packet.src, 3, 6)
                 return
             route = self.routing_table.get_route(dpid, network_packet.dst)
             # Means either IP not known or no next hop (direct connection)
@@ -194,6 +199,7 @@ class Router(RyuApp):
                 actions = [
                     parser.OFPActionSetField(eth_src = eth_packet.dst),
                     parser.OFPActionSetField(eth_dst = mac_of_next_hop),
+                    parser.OFPActionDecNwTtl(),
                     parser.OFPActionOutput(route[1])
                 ]
                 out = parser.OFPPacketOut(
@@ -216,6 +222,77 @@ class Router(RyuApp):
     # functions don't directly handle openflow events, but can be
     # called from functions that do
 
+
+    # method for evaluating firewall
+    def create_firewall(self, datapath, dpid, parser, ofproto):
+        rules = self.firewall_rules.get_rules(dpid)
+        for rule in rules:
+            OpenFlowMatch = {}
+            for (key, value) in rule["match"].items():
+                if key == "ip_proto":
+                    OpenFlowMatch["ip_proto"] = int(value, 16)
+                    OpenFlowMatch["eth_type"] = ether_types.ETH_TYPE_IP
+                if key == "ip_dst":
+                    OpenFlowMatch["eth_type"] = ether_types.ETH_TYPE_IP
+                    OpenFlowMatch["ipv4_dst"] = value
+                if key == "tcp_dst":
+                    OpenFlowMatch["tcp_dst"] = value
+                    OpenFlowMatch["ip_proto"] = 6 # IP protocol value for TCP
+                    OpenFlowMatch["eth_type"] = ether_types.ETH_TYPE_IP
+                if key == "eth_type":
+                    OpenFlowMatch["eth_type"] = int(value, 16)
+                if key == "udp_dst":
+                    OpenFlowMatch["udp_dst"] = value
+                    OpenFlowMatch["ip_proto"] = 17 # IP protocol value for UDP
+                    OpenFlowMatch["eth_type"] = ether_types.ETH_TYPE_IP
+            match = parser.OFPMatch(**OpenFlowMatch)
+            actions = []
+            if(rule["allow"] == True):
+                actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
+            self.__add_flow(datapath, rule["priority"], match, actions)
+
+    def __send_icmp_packet(self, pkt, datapath, dpid, parser, ofproto, dst_ip, type:int, code:int):
+
+        route = self.routing_table.get_route(dpid, dst_ip)
+        interface = self.interface_table.get_interface(dpid, route[1])
+        ip_packet = pkt.get_protocol(ipv4)
+        eth_packet = pkt.get_protocol(ethernet)
+        eth_layer = ethernet(dst = self.arp_table.get_hw(dpid, dst_ip),
+                            src = interface["hw"],
+                            ethertype = ether_types.ETH_TYPE_IP
+                            )
+        
+        ip_layer = ipv4(proto=1,
+                             src=self.interface_table.get_interface(dpid, route[1])["ip"],
+                             dst=dst_ip
+                             )
+        
+        icmp_payload = pkt.get_protocol(icmp).serialize(payload=None, prev=ip_packet)
+        bad_packet_data = dest_unreach(
+            data=ip_packet.serialize(payload=icmp_payload, prev=eth_packet) + icmp_payload
+        )
+
+        icmp_layer = icmp(type_=type, code=code, data=bad_packet_data)
+
+        p = packet.Packet()
+        p.add_protocol(eth_layer)
+        p.add_protocol(ip_layer)
+        p.add_protocol(icmp_layer)
+        p.serialize()
+        actions = [
+            parser.OFPActionOutput(route[1])
+        ]
+        out = parser.OFPPacketOut(
+            datapath=datapath, 
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER, 
+            actions=actions, 
+            data=p.data
+        )
+        self.logger.info("Sending icmp message")
+        datapath.send_msg(out)
+        
+
     def __add_flow(self, datapath, priority, match, actions, idle=60, hard=0):
         """
         Install Flow Table Modification
@@ -236,10 +313,8 @@ class Router(RyuApp):
             idle_timeout=idle,
             hard_timeout=hard,
         )
-        self.logger.info(
-            "✍️\tflow-Mod written to datapath: {}".format(dpid_to_str(datapath.id))
-        )
         datapath.send_msg(mod)
+
 
     def __illegal_packet(self, pkt, log=False):
         """
